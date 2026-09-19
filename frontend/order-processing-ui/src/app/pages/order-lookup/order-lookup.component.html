@@ -1,0 +1,55 @@
+<h2>Order lookup</h2>
+
+<div class="field">
+  <label for="searchId">Order ID</label>
+  <input id="searchId" type="text" [(ngModel)]="searchId" name="searchId" />
+  <button type="button" (click)="search()">Look up</button>
+</div>
+
+@if (loading()) {
+  <p>Loading...</p>
+}
+
+@if (errorMessage()) {
+  <p class="error">{{ errorMessage() }}</p>
+}
+
+@if (order(); as o) {
+  <div class="order-details">
+    <p><strong>Order ID:</strong> {{ o.id }}</p>
+    <p><strong>Customer reference:</strong> {{ o.customerReference }}</p>
+    <p><strong>Status:</strong> {{ o.status }}</p>
+    <p><strong>Total:</strong> {{ o.totalAmount | number: '1.2-2' }}</p>
+    <p><strong>Notification:</strong> <app-notification-status-badge [status]="o.notificationStatus" /></p>
+
+    <h3>Lines</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Product</th>
+          <th>Quantity</th>
+          <th>Unit price</th>
+          <th>Line total</th>
+        </tr>
+      </thead>
+      <tbody>
+        @for (line of o.lines; track line.productCode) {
+          <tr>
+            <td>{{ line.productCode }}</td>
+            <td>{{ line.quantity }}</td>
+            <td>{{ line.unitPriceAtPurchase | number: '1.2-2' }}</td>
+            <td>{{ line.lineTotal | number: '1.2-2' }}</td>
+          </tr>
+        }
+      </tbody>
+    </table>
+
+    @if (o.status === 'Confirmed') {
+      <button type="button" (click)="cancel()" [disabled]="cancelling()">
+        {{ cancelling() ? 'Cancelling...' : 'Cancel order' }}
+      </button>
+    }
+  </div>
+}
+
+<p><a routerLink="/orders/new">Create another order</a></p>

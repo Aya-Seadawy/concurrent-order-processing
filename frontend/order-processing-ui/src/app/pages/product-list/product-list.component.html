@@ -1,0 +1,30 @@
+<h2>Products</h2>
+
+@if (loading()) {
+  <p>Loading products...</p>
+} @else if (error()) {
+  <p class="error">{{ error() }}</p>
+} @else {
+  <table>
+    <thead>
+      <tr>
+        <th>Code</th>
+        <th>Name</th>
+        <th>Price</th>
+        <th>Available</th>
+      </tr>
+    </thead>
+    <tbody>
+      @for (product of products(); track product.code) {
+        <tr>
+          <td>{{ product.code }}</td>
+          <td>{{ product.name }}</td>
+          <td>{{ product.unitPrice | number: '1.2-2' }}</td>
+          <td>{{ product.availableQuantity }}</td>
+        </tr>
+      }
+    </tbody>
+  </table>
+}
+
+<p><a routerLink="/orders/new">Create an order</a></p>

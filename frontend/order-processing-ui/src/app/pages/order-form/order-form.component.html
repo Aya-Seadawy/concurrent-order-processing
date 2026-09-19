@@ -1,0 +1,45 @@
+<h2>Create Order</h2>
+
+<form [formGroup]="form" (ngSubmit)="submit()">
+  <div class="field">
+    <label for="customerReference">Customer reference</label>
+    <input id="customerReference" type="text" formControlName="customerReference" />
+    @if (form.get('customerReference')?.invalid && form.get('customerReference')?.touched) {
+      <p class="field-error">Customer reference is required.</p>
+    }
+  </div>
+
+  <h3>Line items</h3>
+  <div formArrayName="lines">
+    @for (line of lines.controls; track line; let i = $index) {
+      <div [formGroupName]="i" class="line-item">
+        <select formControlName="productCode">
+          <option value="" disabled>Select a product</option>
+          @for (product of products(); track product.code) {
+            <option [value]="product.code">{{ product.code }} - {{ product.name }} (stock: {{ product.availableQuantity }})</option>
+          }
+        </select>
+
+        <input type="number" min="1" formControlName="quantity" />
+
+        <button type="button" (click)="removeLine(i)" [disabled]="lines.length === 1">Remove</button>
+      </div>
+    }
+  </div>
+
+  <button type="button" (click)="addLine()">Add line</button>
+
+  <div class="actions">
+    <button type="submit" [disabled]="submitting()">
+      {{ submitting() ? 'Submitting...' : 'Submit order' }}
+    </button>
+  </div>
+
+  @if (errorMessage()) {
+    <p class="error" [class.warning]="errorCode() === 'request_in_progress'">
+      <strong>{{ errorCode() }}:</strong> {{ errorMessage() }}
+    </p>
+  }
+</form>
+
+<p><a routerLink="/products">Back to products</a></p>

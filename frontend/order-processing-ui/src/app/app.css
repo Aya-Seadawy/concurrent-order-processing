@@ -1,0 +1,22 @@
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid #ddd;
+}
+
+.app-header h1 {
+  font-size: 1.25rem;
+  margin: 0;
+}
+
+.app-header nav a {
+  margin-right: 1rem;
+}
+
+main {
+  padding: 1.5rem;
+  max-width: 800px;
+  margin: 0 auto;
+}

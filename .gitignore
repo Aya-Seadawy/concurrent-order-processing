@@ -1,0 +1,16 @@
+# .NET
+bin/
+obj/
+*.user
+backend/src/OrderProcessing.Api/orders.db
+backend/src/OrderProcessing.Api/orders.db-*
+**/orders.db
+**/orders.db-*
+
+# Angular / Node
+node_modules/
+frontend/order-processing-ui/dist/
+frontend/order-processing-ui/.angular/
+
+# IDE
+.vs/
