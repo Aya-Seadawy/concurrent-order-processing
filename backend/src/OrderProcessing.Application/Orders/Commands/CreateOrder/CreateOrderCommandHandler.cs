@@ -1,4 +1,6 @@
+using System.Text.Json;
 using MediatR;
+using Microsoft.Extensions.Logging;
 using OrderProcessing.Application.Common.Constants;
 using OrderProcessing.Application.Common.Interfaces;
 using OrderProcessing.Application.Common.Mapping;
@@ -15,6 +17,8 @@ namespace OrderProcessing.Application.Orders.Commands.CreateOrder;
 /// </summary>
 public sealed class CreateOrderCommandHandler : IRequestHandler<CreateOrderCommand, CreateOrderResult>
 {
+    private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web);
+
     private readonly IUnitOfWork _unitOfWork;
     private readonly IProductRepository _products;
     private readonly IOrderRepository _orders;
@@ -23,6 +27,7 @@ public sealed class CreateOrderCommandHandler : IRequestHandler<CreateOrderComma
     private readonly IDateTimeProvider _clock;
     private readonly IIdempotencyPayloadHasher _hasher;
     private readonly IChaosHook _chaosHook;
+    private readonly ILogger<CreateOrderCommandHandler> _logger;
 
     public CreateOrderCommandHandler(
         IUnitOfWork unitOfWork,
@@ -32,7 +37,8 @@ public sealed class CreateOrderCommandHandler : IRequestHandler<CreateOrderComma
         IIdempotencyRecordRepository idempotencyRecords,
         IDateTimeProvider clock,
         IIdempotencyPayloadHasher hasher,
-        IChaosHook chaosHook)
+        IChaosHook chaosHook,
+        ILogger<CreateOrderCommandHandler> logger)
     {
         _unitOfWork = unitOfWork;
         _products = products;
@@ -42,6 +48,7 @@ public sealed class CreateOrderCommandHandler : IRequestHandler<CreateOrderComma
         _clock = clock;
         _hasher = hasher;
         _chaosHook = chaosHook;
+        _logger = logger;
     }
 
     public async Task<CreateOrderResult> Handle(CreateOrderCommand request, CancellationToken cancellationToken)
@@ -108,6 +115,8 @@ public sealed class CreateOrderCommandHandler : IRequestHandler<CreateOrderComma
                     await _products.RestoreStockAsync(code, qty, cancellationToken);
                 }
 
+                _logger.LogWarning("StockConflict for product {ProductCode}: requested {Quantity}", line.ProductCode, line.Quantity);
+
                 var conflictResult = CreateOrderResult.InsufficientStock(
                     new ApiError(ErrorCodes.InsufficientStock, $"Insufficient stock for product '{line.ProductCode}'."));
                 claim.Complete(conflictResult.StatusCode, conflictResult.ResponseBody, null, _clock.UtcNow);
@@ -149,12 +158,23 @@ public sealed class CreateOrderCommandHandler : IRequestHandler<CreateOrderComma
 
         if (existing.RequestHash != requestHash)
         {
+            _logger.LogWarning("IdempotencyKeyConflict for key {Key}", key);
             return CreateOrderResult.KeyConflict(new ApiError(
                 ErrorCodes.IdempotencyKeyConflict, "This Idempotency-Key was already used with a different request payload."));
         }
 
         if (existing.Status == IdempotencyStatus.Completed)
         {
+            _logger.LogInformation("IdempotencyReplay for key {Key}, order {OrderId}", key, existing.OrderId);
+            if (existing.OrderId.HasValue)
+            {
+                var currentOrder = await OrderLoader.LoadAsync(_orders, _notifications, existing.OrderId.Value, cancellationToken);
+                if (currentOrder != null)
+                {
+                    return CreateOrderResult.Cached(existing.ResponseStatusCode!.Value, JsonSerializer.Serialize(currentOrder, SerializerOptions));
+                }
+            }
+
             return CreateOrderResult.Cached(existing.ResponseStatusCode!.Value, existing.ResponseBody!);
         }
 

@@ -22,6 +22,12 @@
     <p><strong>Total:</strong> {{ o.totalAmount | number: '1.2-2' }}</p>
     <p><strong>Notification:</strong> <app-notification-status-badge [status]="o.notificationStatus" /></p>
 
+    @if (o.notificationStatus === 'Failed') {
+      <p class="error">
+        <strong>Delivery failure:</strong> Notification delivery failed after exhausting all retry attempts.
+      </p>
+    }
+
     <h3>Lines</h3>
     <table>
       <thead>

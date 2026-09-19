@@ -31,10 +31,17 @@ public sealed class OrdersController : ControllerBase
             return BadRequest(new ApiError(ErrorCodes.ValidationError, "Idempotency-Key header is required."));
         }
 
+        if (request is null)
+        {
+            return BadRequest(new ApiError(ErrorCodes.ValidationError, "Request body is required."));
+        }
+
         var command = new CreateOrderCommand(
             idempotencyKey,
-            request.CustomerReference,
-            request.Lines.Select(l => new CreateOrderLineRequest(l.ProductCode, l.Quantity)).ToList());
+            request.CustomerReference ?? string.Empty,
+            (request.Lines ?? new List<OrderLineRequestBody>())
+                .Select(l => new CreateOrderLineRequest(l.ProductCode, l.Quantity))
+                .ToList());
 
         var result = await _mediator.Send(command, cancellationToken);
 

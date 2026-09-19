@@ -69,7 +69,8 @@ never used) and covers all six required scenarios:
 3. `IdempotencyKeyReuseWithDifferentPayloadTests` — reusing a settled key with a different quantity: 409, no
    additional DB changes.
 4. `ConcurrentCancelTests` — cancelling the same order twice concurrently: final status `Cancelled`, stock
-   restored exactly once.
+   restored exactly once. Also verifies that a later replay of the original creation submission does not
+   create or confirm the order again.
 5. `TransactionRollbackTests` — a chaos hook forces a failure just before commit: stock/order/notification/
    idempotency-key changes all roll back.
 6. `NotificationRetryTests` — delivery configured to fail then succeed (retry + eventual `Sent`), and a

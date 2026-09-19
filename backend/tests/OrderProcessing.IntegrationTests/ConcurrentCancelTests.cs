@@ -48,4 +48,39 @@ public class ConcurrentCancelTests : IAsyncLifetime
         var final = await _client.GetOrderAsync(orderId);
         Assert.Equal("Cancelled", final.Body.GetString("status"));
     }
+
+    [Fact]
+    public async Task LaterReplayOfOriginalSubmission_DoesNotCreateOrConfirmAgain()
+    {
+        var stockBeforeOrder = await _factory.GetProductStockAsync("WIDGET-1");
+
+        // 1. Create order
+        var created = await _client.CreateOrderAsync("replay-after-cancel-key", "cust-cancel-replay", ("WIDGET-1", 2));
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        var orderId = created.Body.GetGuid("id");
+
+        // 2. Cancel order -> stock restored
+        var cancel = await _client.CancelOrderAsync(orderId);
+        Assert.Equal(HttpStatusCode.OK, cancel.StatusCode);
+        Assert.Equal("Cancelled", cancel.Body.GetString("status"));
+        Assert.Equal(stockBeforeOrder, await _factory.GetProductStockAsync("WIDGET-1"));
+
+        var orderCountAfterCancel = await _factory.CountOrdersAsync();
+
+        // 3. Later replay of the original submission with the same idempotency key
+        var replay = await _client.CreateOrderAsync("replay-after-cancel-key", "cust-cancel-replay", ("WIDGET-1", 2));
+
+        // Replay must not deduct stock again
+        var stockAfterReplay = await _factory.GetProductStockAsync("WIDGET-1");
+        Assert.Equal(stockBeforeOrder, stockAfterReplay);
+
+        // Replay must not create a new order
+        var orderCountAfterReplay = await _factory.CountOrdersAsync();
+        Assert.Equal(orderCountAfterCancel, orderCountAfterReplay);
+
+        // Replay must not confirm the order again (remains Cancelled in database and in replay response)
+        Assert.Equal("Cancelled", replay.Body.GetString("status"));
+        var inDb = await _client.GetOrderAsync(orderId);
+        Assert.Equal("Cancelled", inDb.Body.GetString("status"));
+    }
 }
