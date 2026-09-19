@@ -1,64 +1,145 @@
-# Design Note
+# Design Note: Concurrent Order Processing
 
-## Transaction boundary, concurrency mechanism, DB constraints
+## 1. Database Schema & ER Diagram
 
-**Order creation** runs inside a single DB transaction per request: (1) attempt to `INSERT` a claim row into
-`IdempotencyKeys` (PK on `Key`), (2) if that succeeds, run a conditional atomic `UPDATE Products SET
-AvailableQuantity = AvailableQuantity - @qty WHERE Code=@code AND AvailableQuantity >= @qty` per line and check
-rows-affected — zero means insufficient stock; on a multi-line failure, lines already deducted in this same
-attempt are compensated (added back) before the transaction commits, so a rejected order never leaves a partial
-stock change, (3) insert the `Order`/`OrderLines`/`OrderNotification` rows, (4) mark the claim `Completed` with
-the response snapshot, (5) commit everything atomically. No process-local locks are used anywhere — correctness
-comes entirely from the DB transaction plus the conditional `UPDATE`'s row-count check and the unique index on
-`IdempotencyKeys.Key`, so the same design would hold under SQL Server/Postgres with real concurrent writers.
-**Cancellation** uses the same pattern: `UPDATE Orders SET Status='Cancelled' WHERE Id=@id AND Status='Confirmed'`;
-only if exactly one row is affected does the handler restore stock and commit — a second concurrent/replayed
-cancel finds zero rows affected and idempotently returns the current (already-Cancelled) state without a second
-restoration.
+```mermaid
+erDiagram
+    Products {
+        int Id PK
+        string Code UK "Unique Product Code"
+        string Name
+        decimal UnitPrice "Decimal precision"
+        int AvailableQuantity "Check >= 0"
+    }
 
-## Idempotency lifecycle
+    Orders {
+        guid Id PK
+        string CustomerReference
+        string Status "Confirmed | Cancelled"
+        decimal TotalAmount
+        datetime CreatedAtUtc
+        datetime CancelledAtUtc "Nullable"
+    }
 
-Everything — claim, business logic, and finalization — happens in **one** transaction, so a crash anywhere
-before commit leaves nothing behind (no stuck "Processing" rows to reconcile later). The claim `INSERT` is
-attempted first, before any business logic, to fail fast on a duplicate. On a unique-constraint violation the
-existing row is read: hash mismatch → 409 `idempotency_key_conflict`; `Completed` + matching hash → the
-**stored** response is replayed verbatim (no re-execution); still `Processing` → 409 `request_in_progress`.
-Payload equivalence = same `customerReference` + the same multiset of `(productCode, quantity)` pairs, compared
-order-insensitively via a SHA-256 hash of the normalized payload. SQLite is single-writer: a second concurrent
-request's claim `INSERT` blocks (governed by `Default Timeout=5s` on the connection string) rather than failing
-immediately, then resolves deterministically once the first transaction commits or rolls back — this is
-documented as the "response while a duplicate is processing" behavior for this engine; on a real multi-writer
-engine the 409 `request_in_progress` path would be hit directly instead of blocking.
+    OrderLines {
+        guid Id PK
+        guid OrderId FK "Cascade on delete"
+        string ProductCode
+        int Quantity "Positive integer"
+        decimal UnitPriceAtPurchase
+    }
 
-## Multi-worker notification scaling (design-only)
+    OrderNotifications {
+        guid Id PK "Stable EventId across retries"
+        guid OrderId FK
+        string Status "Pending | InProgress | Sent | Failed"
+        int AttemptCount
+        datetime NextAttemptAtUtc
+        datetime ClaimedAtUtc "Nullable (lease check)"
+        string LastError "Nullable"
+        datetime CreatedAtUtc
+        datetime SentAtUtc "Nullable"
+    }
 
-Today one `BackgroundService` polls and claims rows itself (single instance, adequate for the assessment). To
-run several worker instances safely: add a `ClaimedBy` (worker id) column and a lease (`ClaimedAtUtc` +
-expiry), and claim with an atomic conditional update (`UPDATE ... SET Status='InProgress', ClaimedBy=@me WHERE
-Status='Pending' AND NextAttemptAtUtc<=now LIMIT n`) — on Postgres/SQL Server this pairs with `FOR UPDATE SKIP
-LOCKED` to let workers claim disjoint batches without blocking each other. Each worker renews its lease with a
-heartbeat while processing; a periodic sweep releases any `InProgress` row whose lease has expired (crash
-recovery) back to `Pending`. This makes delivery **at-least-once**: if a worker sends successfully but crashes
-before marking `Sent`, the lease-expiry sweep will hand the same notification to another worker, which resends.
-The stable `EventId` (the notification's own `Id`, unchanged across retries) is what lets a real downstream
-consumer deduplicate that resend; this assessment's fake delivery service doesn't need to, but the id is already
-plumbed through for that purpose.
+    IdempotencyKeys {
+        string Key PK "Header Idempotency-Key"
+        string RequestHash "SHA256 normalized payload"
+        string Status "Processing | Completed"
+        guid OrderId "Nullable FK"
+        int ResponseStatusCode "Nullable (201 / 409)"
+        text ResponseBody "Nullable JSON snapshot"
+        datetime CreatedAtUtc
+        datetime CompletedAtUtc "Nullable"
+    }
 
-## Real payment provider (design-only)
+    Orders ||--|{ OrderLines : contains
+    Orders ||--o| OrderNotifications : triggers
+    Orders ||--o| IdempotencyKeys : references
+```
 
-Add a `PendingPayment` order status. The DB transaction that reserves stock and creates the order **commits
-first** (payment not yet attempted), with a `PaymentIntentId` column left null. A separate step calls the
-payment provider **outside any DB transaction**; on success, a new short transaction stores the returned
-`PaymentIntentId` and flips status to `Confirmed`. If the app crashes after the provider call succeeds but
-before that update commits, the order is stuck `PendingPayment` with no recorded intent — solved by a
-reconciliation job that, for stuck `PendingPayment` orders past a timeout, queries the provider (idempotently,
-by an intent key generated before the call and sent to the provider) to discover the actual outcome and finalize
-or compensate (release stock) accordingly. This avoids ever holding a DB transaction open across a network call.
+---
 
-## Minimum logs and metrics
+## 2. Order Creation & Idempotency Flow
 
-Structured log events: `StockConflict` (product, requested/available qty), `IdempotencyDuplicate`/`IdempotencyReplay`
-(key, outcome), `NotificationExhausted` (notification id, order id, attempts). Metrics: counters for
-`orders_stock_conflict_total`, `orders_idempotency_duplicate_total`, `notifications_failed_total`; a
-gauge/histogram for pending-notification age (`now - NextAttemptAtUtc` over the `Pending` set) to detect stuck
-notifications before they exhaust retries.
+Everything runs inside **one atomic database transaction**:
+
+```mermaid
+flowchart TD
+    Start([POST /api/orders]) --> Hash[Compute Payload SHA256 Hash]
+    Hash --> Tx[Begin DB Transaction]
+    Tx --> InsertKey{Try INSERT into<br/>IdempotencyKeys<br/>Status=Processing}
+
+    InsertKey -- Unique Constraint Failed --> CatchConflict[Rollback Tx & Query Existing Key]
+    CatchConflict --> CheckHash{Stored Hash == New Hash?}
+    CheckHash -- No --> Return409Conflict[Return 409 Conflict<br/>idempotency_key_conflict]
+    CheckHash -- Yes & Status=Completed --> ReturnCached[Return Stored Response<br/>201 / 409 verbatim]
+    CheckHash -- Yes & Status=Processing --> Return409Progress[Return 409 Conflict<br/>request_in_progress]
+
+    InsertKey -- Insert Succeeded --> DeductStock[For each line: UPDATE Products<br/>AvailableQuantity = AvailableQuantity - Qty<br/>WHERE AvailableQuantity >= Qty]
+    DeductStock --> StockSufficient{Rows Affected == 1?}
+
+    StockSufficient -- No --> Compensate[Revert already deducted lines<br/>Set Key Status=Completed<br/>StatusCode=409 insufficient_stock]
+    Compensate --> CommitReject[Commit Tx & Return 409 Conflict]
+
+    StockSufficient -- Yes --> InsertOrder[INSERT Orders & OrderLines]
+    InsertOrder --> InsertNotification[INSERT OrderNotifications<br/>Status=Pending]
+    InsertNotification --> FinalizeKey[UPDATE IdempotencyKeys<br/>Status=Completed, StatusCode=201, OrderId]
+    FinalizeKey --> CommitAll[Commit DB Transaction]
+    CommitAll --> Return201[Return 201 Created]
+```
+
+---
+
+## 3. Core Architecture Highlights
+
+### A. Concurrency & Transactions
+- **No Process-Local Locks**: Concurrency is enforced by database atomic conditional updates (`UPDATE Products ... WHERE AvailableQuantity >= @qty`) and relational unique keys (`PK on IdempotencyKeys.Key`).
+- **All-in-One Transaction**: Idempotency claim, stock deduction, order record, and notification row share a single transaction. If a crash occurs before commit, the claim is rolled back completely—preventing ghost "stuck" records without distributed 2PC.
+- **SQLite Concurrency Model**: SQLite uses single-writer serialized writes with a 5-second busy timeout (`Default Timeout=5`). Concurrent writes queue briefly; if the timeout expires, `409 request_in_progress` is returned. On PostgreSQL/SQL Server, this path is hit directly without waiting.
+
+### B. Order Cancellation (Idempotent)
+- Conditional atomic update: `UPDATE Orders SET Status='Cancelled' WHERE Id=@id AND Status='Confirmed'`.
+- Only if exactly **1 row is updated** is inventory restored.
+- If **0 rows are updated**, the system re-reads the order: if already `Cancelled`, it returns 200 idempotently without double-restoring stock; if missing, returns 404.
+
+---
+
+## 4. Extensions & Future Architecture (Design-Only)
+
+### A. Multi-Worker Notification Scaling
+```mermaid
+sequenceDiagram
+    participant W1 as Worker 1
+    participant DB as Database (OrderNotifications)
+    participant Svc as Delivery Service
+    
+    W1->>DB: UPDATE TOP(N) SET Status='InProgress', ClaimedBy='W1', ClaimedAtUtc=NOW<br/>WHERE Status='Pending' AND NextAttemptAtUtc <= NOW (SKIP LOCKED)
+    W1->>Svc: SendAsync(StableEventId, Payload)
+    alt Success
+        W1->>DB: UPDATE SET Status='Sent', SentAtUtc=NOW
+    else Failure
+        W1->>DB: UPDATE SET Status='Pending', AttemptCount++, NextAttemptAtUtc=NOW+Backoff
+    end
+    Note over DB: Heartbeat & Lease Sweep:<br/>If ClaimedAtUtc expired (>30s) -> reset to 'Pending'
+```
+- **At-Least-Once Delivery**: Handled downstream by idempotency consumers keyed on the stable `EventId` (`OrderNotifications.Id`).
+
+### B. Real Payment Gateway (Decoupled Network Call)
+- **Do not hold DB transactions over HTTP calls**:
+  1. Transaction 1: Reserve stock and save order as `PendingPayment`. Commit immediately.
+  2. Outside transaction: Call payment provider with idempotent `PaymentIntentId`.
+  3. Transaction 2: On payment success, update order to `Confirmed`.
+  4. Background reconciliation job checks stuck `PendingPayment` orders against the payment gateway API to either finalize or release reserved stock.
+
+---
+
+## 5. Minimum Telemetry (Logs & Metrics)
+
+| Telemetry Type | Name | Purpose |
+|---|---|---|
+| **Structured Log** | `StockConflict` | Alert when stock is exhausted (product, requested, available). |
+| **Structured Log** | `IdempotencyKeyConflict` | Track payload tampering with reused keys. |
+| **Structured Log** | `NotificationExhausted` | Alert operations when a delivery permanently fails. |
+| **Metric Counter** | `orders_stock_conflict_total` | Business metric for inventory sizing. |
+| **Metric Counter** | `orders_idempotency_duplicate_total` | Network/client retry volume. |
+| **Metric Gauge** | `pending_notification_oldest_age_seconds` | SLA monitoring for notification worker backlog. |
