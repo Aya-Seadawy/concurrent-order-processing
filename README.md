@@ -120,11 +120,13 @@ path is reachable directly, without blocking.
   were implemented and manually verified end-to-end (create → view → cancel, with live notification status).
 - Not implemented (design-only, as the assessment allows): multi-worker notification claiming, a real payment
   provider integration. Both are covered in [docs/design-note.md](docs/design-note.md).
+- Authentication and authorization (e.g., JWT / OAuth2 / API keys) were excluded per the assessment scope and left
+  as unfinished / future work.
 - Angular unit/e2e tests were not added (manual browser verification only) given the time-boxed scope; the
   backend automated test suite covers all required concurrency/transaction scenarios.
 
 ## AI tool disclosure
 
-This solution was developed with GitHub Copilot (agentic mode, Claude Sonnet 4.5) assisting with code
-generation, test scaffolding, and this documentation. All code was reviewed for correctness and matches the
-design described in `docs/design-note.md`; the author can walk through and explain any part of it.
+This solution was developed with GitHub Copilot assisting with code generation, test scaffolding, and serving as a
+reviewer for Clean Architecture and best practices. All code was reviewed for correctness and matches the design
+described in [docs/design-note.md](docs/design-note.md); I can walk through and explain any part of it.
